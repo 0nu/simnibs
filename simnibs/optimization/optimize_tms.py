@@ -8,11 +8,24 @@ Adapted by Guilherme Saturnino, 2019
 import numpy as np
 
 
-def _create_grid(mesh, pos, distance, radius, resolution_pos):
+def _create_grid(mesh, pos, distance, radius, resolution_pos, smooth=0):
     ''' Creates a position grid '''
     # extract ROI
     msh_surf = mesh.crop_mesh(elm_type=2)
     msh_skin = msh_surf.crop_mesh([5, 1005])
+
+    if smooth != 0: # this is the smoothing factor in the plot above
+        import trimesh
+        tri_node_nr = msh_skin.elm.node_number_list[msh_skin.elm.triangles-1] -1
+        tri_node_nr = tri_node_nr[:,:3]
+        a = msh_skin.nodes.node_coord[tri_node_nr]
+        a.shape
+        tri_msh = trimesh.Trimesh(vertices=msh_skin.nodes.node_coord,
+                                  faces=tri_node_nr) # create a Trimesh object based on the skin tris
+        smooth_mesh = trimesh.smoothing.filter_laplacian(tri_msh, lamb=smooth) # do smoothing
+        msh_skin.nodes.node_coord = smooth_mesh.vertices # overwrite simnibs Mesh object's nodes
+        msh_skin.elm.node_number_list[:,:3] = np.array(smooth_mesh.faces)+1 # ... and vertices assignments
+
     target_skin = msh_skin.find_closest_element(pos)
     elm_center = msh_skin.elements_baricenters()[:]
     elm_mask_roi = np.linalg.norm(elm_center - target_skin, axis=1) < 1.2 * radius
@@ -73,7 +86,7 @@ def _rotate_system(R, angle_limits, angle_res):
 
 
 def get_opt_grid(mesh, pos, handle_direction_ref=None, distance=1., radius=20,
-                 resolution_pos=1, resolution_angle=20, angle_limits=None):
+                 resolution_pos=1, resolution_angle=20, angle_limits=None, smooth=0):
     """ Determine the coil positions and orientations for bruteforce TMS optimization
 
     Parameters
@@ -104,7 +117,7 @@ def get_opt_grid(mesh, pos, handle_direction_ref=None, distance=1., radius=20,
     """
     # creates the spatial grid
     coords_mapped, coords_normals = _create_grid(
-        mesh, pos, distance, radius, resolution_pos)
+        mesh, pos, distance, radius, resolution_pos, smooth=smooth)
     
     # Determines the seed y direction
     if handle_direction_ref is None:
@@ -192,3 +205,70 @@ def define_target_region(mesh, target_position, target_radius, tags, elm_type=4)
         np.isin(mesh.elm.elm_type, elm_type)
     ]
     return elm
+
+
+def get_opt_grid_ADM(mesh, pos, handle_direction_ref=None, distance=1., radius=20,
+                 resolution_pos=1, resolution_angle=20, angle_limits=None, smooth=0):
+    """ Determine the coil positions and orientations for ADM TMS optimization
+
+    Parameters
+    ----------
+    mesh: simnibs.msh.mesh_io.Msh object
+        Simnibs mesh object
+    pos: ndarray
+        Coordinates (x, y, z) of reference position
+    handle_direction_ref (optinal): list of float or np.ndarray
+        Vector of handle prolongation direction, in relation to "pos". (Default: do
+        not select a handle direction and scan rotations from -180 to 180)
+    distance: float or None
+        Coil distance to skin surface [mm]. (Default: 1.)
+    radius: float or None
+        Radius of region of interest around the reference position, where the
+        bruteforce simulations are conducted
+    resolution_pos: float or None
+        Resolution in mm of the coil positions in the region of interest.
+    resolution_angle: float or None
+        Resolution in deg of the coil positions in the region of interest (Default: 20)
+    angle_limits: list of float or None
+        Range of angles to get coil rotations for (Default: [-180, 180])
+
+    Returns
+    -------
+    matsimnibs_list: ndarray of size 4x4xNpos
+        list of MATSIMNIBS matrices
+    coil_dir: ndarray of size 3xNrot
+        list of coil directions
+    """
+    # creates the spatial grid
+    coords_mapped, coords_normals = _create_grid(
+        mesh, pos, distance, radius, resolution_pos, smooth=smooth)
+    
+    # Determines the seed y direction
+    if handle_direction_ref is None:
+        y_seed = np.array([0., 1., 0.])
+    else:
+        y_seed = np.array(handle_direction_ref) - np.array(pos)
+        if np.isclose(np.linalg.norm(y_seed), 0.):
+            raise ValueError('The coil Y axis reference is too close to the coil center! ')
+    if angle_limits is None:
+        angle_limits = -180, 180
+
+    matrices = []
+    for p, n in zip(coords_mapped, coords_normals):
+        z = -n
+        y = y_seed - (z * y_seed.dot(z))
+        y /= np.linalg.norm(y)
+        x = np.cross(y, z)
+        R = np.array([x, y, z]).T
+        A = np.eye(4)
+        A[:3, :3] = R
+        A[:3, 3] = p
+        matrices.append(A)
+
+    matrices = np.array(matrices).transpose(1, 2, 0)
+
+    directions = np.array(
+        _rotate_system(np.eye(3), angle_limits, resolution_angle)
+    )[:, 1].T
+
+    return matrices, directions
